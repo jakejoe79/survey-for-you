@@ -9,7 +9,8 @@
     "start": "node dist/server.js",
     "test": "jest --runInBand",
     "db:migrate": "node -e \"require('./dist/scripts/migrate').main().catch((e)=>{console.error(e);process.exit(1)})\"",
-    "db:migrate:dev": "ts-node src/scripts/migrate.ts"
+    "db:migrate:dev": "ts-node src/scripts/migrate.ts",
+    "worker:side-effects": "ts-node src/workers/sideEffectsWorker.ts"
   },
   "keywords": [],
   "author": "",

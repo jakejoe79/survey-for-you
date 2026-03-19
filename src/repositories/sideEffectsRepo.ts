@@ -1,17 +1,27 @@
 import type { PoolClient } from 'pg';
 
+export type SideEffectRow = {
+  id: number;
+  idempotency_id: number;
+  effect_type: string;
+  status: 'pending' | 'running' | 'executed';
+  attempt_id: string | null;
+  payload: unknown;
+  updated_at: string;
+};
+
 export async function insertSideEffectOnce(
   client: PoolClient,
-  params: { idempotencyId: number; effectType: string },
+  params: { idempotencyId: number; effectType: string; payload?: unknown },
 ): Promise<{ inserted: boolean; sideEffectId?: number }> {
   const res = await client.query<{ id: number }>(
     `
-    INSERT INTO side_effects (idempotency_id, effect_type)
-    VALUES ($1, $2)
+    INSERT INTO side_effects (idempotency_id, effect_type, payload)
+    VALUES ($1, $2, $3::jsonb)
     ON CONFLICT (idempotency_id, effect_type) DO NOTHING
     RETURNING id
     `,
-    [params.idempotencyId, params.effectType],
+    [params.idempotencyId, params.effectType, JSON.stringify(params.payload ?? {})],
   );
 
   if ((res.rowCount ?? 0) > 0) return { inserted: true, sideEffectId: res.rows[0]!.id };
@@ -35,6 +45,51 @@ export async function tryClaimForRunning(
     [params.idempotencyId, params.effectType, params.attemptId],
   );
   return { claimed: (res.rowCount ?? 0) > 0 };
+}
+
+export async function claimNextPending(
+  client: PoolClient,
+  params: { attemptId: string },
+): Promise<SideEffectRow | null> {
+  const res = await client.query<SideEffectRow>(
+    `
+    UPDATE side_effects
+    SET status = 'running',
+        attempt_id = $1
+    WHERE id = (
+      SELECT id
+      FROM side_effects
+      WHERE status = 'pending'
+      ORDER BY updated_at ASC
+      FOR UPDATE SKIP LOCKED
+      LIMIT 1
+    )
+    RETURNING id, idempotency_id, effect_type, status, attempt_id, payload, updated_at
+    `,
+    [params.attemptId],
+  );
+  return res.rows[0] ?? null;
+}
+
+export async function recoverStuckRunning(
+  client: PoolClient,
+  params: { olderThanSeconds: number },
+): Promise<{ recovered: number }> {
+  const res = await client.query<{ recovered: number }>(
+    `
+    WITH updated AS (
+      UPDATE side_effects
+      SET status = 'pending',
+          attempt_id = NULL
+      WHERE status = 'running'
+        AND updated_at < NOW() - make_interval(secs => $1)
+      RETURNING 1
+    )
+    SELECT COUNT(*)::int AS recovered FROM updated
+    `,
+    [params.olderThanSeconds],
+  );
+  return { recovered: res.rows[0]?.recovered ?? 0 };
 }
 
 export async function markExecuted(

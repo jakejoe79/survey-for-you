@@ -1,0 +1,3 @@
+ALTER TABLE side_effects
+  ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb;
+

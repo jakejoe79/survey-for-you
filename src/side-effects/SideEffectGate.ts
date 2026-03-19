@@ -12,11 +12,13 @@ export async function prepare(
     idempotencyId: number;
     attemptId: string | null;
     effectType: string;
+    payload?: unknown;
   },
 ): Promise<{ shouldRun: boolean }> {
   const gate = await SideEffectsRepo.insertSideEffectOnce(client, {
     idempotencyId: params.idempotencyId,
     effectType: params.effectType,
+    payload: params.payload,
   });
 
   if (!gate.inserted) {

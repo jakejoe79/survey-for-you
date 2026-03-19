@@ -2,6 +2,7 @@ import request from 'supertest';
 import { Pool } from 'pg';
 import { createApp } from '../src/app';
 import { withTx } from '../src/db/tx';
+import { runWorkerOnce } from '../src/workers/sideEffectsWorker';
 
 const TEST_DB_URL = process.env.DATABASE_URL_TEST;
 const hasTestDb = Boolean(TEST_DB_URL);
@@ -131,6 +132,36 @@ maybeDescribe('POST /surveys/quick idempotency canary', () => {
 
     const effectsCount = await pool.query<{ c: string }>("SELECT COUNT(*)::text AS c FROM side_effects WHERE status IN ('pending','running','executed')");
     expect(effectsCount.rows[0]!.c).toBe('1');
+  });
+
+  it('processes pending side effects without any requests', async () => {
+    // Create an idempotency row + pending side effect directly, then run the worker once.
+    const idRes = await pool.query<{ id: number }>(
+      `
+      INSERT INTO idempotency_keys (user_id, key, status, request_version, expires_at)
+      VALUES ($1, 'seed-key', 'completed', 1, NOW() + interval '24 hours')
+      RETURNING id
+      `,
+      [userId],
+    );
+    const idemId = idRes.rows[0]!.id;
+
+    await pool.query(
+      `
+      INSERT INTO side_effects (idempotency_id, effect_type, status, payload)
+      VALUES ($1, 'quick_log_analytics', 'pending', '{}'::jsonb)
+      `,
+      [idemId],
+    );
+
+    const didWork = await runWorkerOnce(pool);
+    expect(didWork).toBe(true);
+
+    const status = await pool.query<{ status: string }>(
+      `SELECT status FROM side_effects WHERE idempotency_id = $1 AND effect_type = 'quick_log_analytics'`,
+      [idemId],
+    );
+    expect(status.rows[0]!.status).toBe('executed');
   });
 });
 
