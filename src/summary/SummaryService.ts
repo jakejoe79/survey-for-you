@@ -27,7 +27,7 @@ function rateCentsPerHour(payoutCents: number, durationSeconds: number): number 
 
 export async function getAfterNewEntry(
   client: PoolClient,
-  params: { userId: number; localDate: string },
+  params: { userId: number; localDate: string; timezone: string },
 ): Promise<Summary> {
   try {
     const today = await client.query<{ payout: number; duration: number }>(
@@ -36,9 +36,9 @@ export async function getAfterNewEntry(
              COALESCE(SUM(duration_seconds), 0)::int AS duration
       FROM survey_entries
       WHERE user_id = $1
-        AND completed_at_utc >= (NOW() - interval '24 hours') -- cheap approximation for MVP
+        AND (completed_at_utc AT TIME ZONE $3)::date = $2::date
       `,
-      [params.userId],
+      [params.userId, params.localDate, params.timezone],
     );
 
     const todayEarningsCents = today.rows[0]!.payout;
@@ -50,9 +50,9 @@ export async function getAfterNewEntry(
              COALESCE(SUM(duration_seconds), 0)::int AS duration
       FROM survey_entries
       WHERE user_id = $1
-        AND completed_at_utc >= (NOW() - interval '30 days')
+        AND (completed_at_utc AT TIME ZONE $3)::date >= ($2::date - 30)
       `,
-      [params.userId],
+      [params.userId, params.localDate, params.timezone],
     );
     const histRate = rateCentsPerHour(hist.rows[0]!.payout, hist.rows[0]!.duration);
 

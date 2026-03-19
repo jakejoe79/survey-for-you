@@ -1,6 +1,12 @@
 import express from 'express';
 import type { Pool } from 'pg';
-import { execute as quickLogExecute } from './quick-log/QuickLogService';
+import { withTx } from './db/tx';
+import { claimOrReplay } from './idempotency/IdempotencyService';
+import { computeResolvedHashForLoggingOnly } from './idempotency/IdempotencyService';
+import { logInfo, logWarn } from './lib/logger';
+import { completeWithStub, getForUpdate } from './repositories/idempotencyRepo';
+import { runOnce } from './side-effects/SideEffectGate';
+import { quickLogCore, resolveDefaults } from './quick-log/QuickLogService';
 
 export function createApp(pool: Pool) {
   const app = express();
@@ -25,8 +31,65 @@ export function createApp(pool: Pool) {
     const payload = req.body?.payload ?? req.body;
 
     try {
-      const result = await quickLogExecute(pool, { userId, idempotencyKey, payload });
-      return res.status(result.statusCode).json(result.response);
+      const result = await withTx(pool, async (client) => {
+        const gate = await claimOrReplay(client, { userId, key: idempotencyKey });
+
+        if (gate.type === 'expired') {
+          return { statusCode: 409 as const, body: { error: 'Idempotency key expired — generate a new key' } };
+        }
+
+        if (gate.type === 'processing') {
+          return { statusCode: 202 as const, body: { status: 'processing', retryAfterMs: gate.retryAfterMs } };
+        }
+
+        if (gate.type === 'replay') {
+          // Replay is always boring: return stored response.
+          // But we can log mismatches for debugging.
+          try {
+            const resolved = resolveDefaults(payload);
+            const incomingHash = computeResolvedHashForLoggingOnly(resolved);
+            const row = await getForUpdate(client, { userId, key: idempotencyKey });
+            const storedHash = row?.resolved_request_hash;
+            if (storedHash && storedHash !== incomingHash) {
+              logWarn(
+                { event: 'idempotency_mismatch', userId, idempotencyId: gate.idempotencyId, attemptId: gate.attemptId },
+                { key: idempotencyKey, stored_hash: storedHash, incoming_hash: incomingHash, request_version: row?.request_version },
+              );
+            }
+          } catch {
+            // ignore
+          }
+          return { statusCode: 200 as const, body: gate.response };
+        }
+
+        // claimed
+        const core = await quickLogCore(client, { userId, payload, writeSource: 'quick_log' });
+
+        // Example gated side effect (no-op body): proves once-only behavior.
+        await runOnce(client, {
+          userId,
+          idempotencyId: gate.idempotencyId,
+          attemptId: gate.attemptId,
+          effectType: 'quick_log_analytics',
+          fn: async () => undefined,
+        });
+
+        await completeWithStub(client, {
+          idempotencyId: gate.idempotencyId,
+          resolvedRequestHash: core.resolvedRequestHash,
+          responseVersion: 1,
+          responseJson: core.response,
+        });
+
+        logInfo(
+          { event: 'quick_log_completed', userId, idempotencyId: gate.idempotencyId, attemptId: gate.attemptId },
+          { key: idempotencyKey },
+        );
+
+        return { statusCode: 200 as const, body: core.response };
+      });
+
+      return res.status(result.statusCode).json(result.body);
     } catch (err) {
       return res.status(400).json({ error: String(err) });
     }

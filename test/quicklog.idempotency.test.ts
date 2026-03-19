@@ -1,6 +1,7 @@
 import request from 'supertest';
 import { Pool } from 'pg';
 import { createApp } from '../src/app';
+import { withTx } from '../src/db/tx';
 
 const TEST_DB_URL = process.env.DATABASE_URL_TEST;
 const hasTestDb = Boolean(TEST_DB_URL);
@@ -71,9 +72,64 @@ maybeDescribe('POST /surveys/quick idempotency canary', () => {
     const entryCount = await pool.query<{ c: string }>('SELECT COUNT(*)::text AS c FROM survey_entries WHERE user_id = $1', [userId]);
     expect(entryCount.rows[0]!.c).toBe('1');
 
-    // Side effects table isn't used in this minimal endpoint yet; ensure it's empty for now.
     const effectsCount = await pool.query<{ c: string }>('SELECT COUNT(*)::text AS c FROM side_effects');
-    expect(effectsCount.rows[0]!.c).toBe('0');
+    expect(effectsCount.rows[0]!.c).toBe('1');
+  });
+
+  it('rolls back on failure (transaction core canary)', async () => {
+    await expect(
+      withTx(pool, async (client) => {
+        await client.query(
+          `
+          INSERT INTO survey_entries (user_id, platform_id, payout_cents, duration_seconds)
+          VALUES ($1, 1, 100, 60)
+          `,
+          [userId],
+        );
+        throw new Error('boom');
+      }),
+    ).rejects.toThrow('boom');
+
+    const res = await pool.query<{ c: string }>('SELECT COUNT(*)::text AS c FROM survey_entries WHERE user_id = $1', [userId]);
+    expect(res.rows[0]!.c).toBe('0');
+  });
+
+  it('handles concurrent same-key requests safely', async () => {
+    const key = 'concurrent-key';
+    const payload = {
+      platformId: 1,
+      payoutCents: 150,
+      durationSeconds: 600,
+      timezone: 'UTC',
+    };
+
+    const [a, b] = await Promise.all([
+      request(app).post('/surveys/quick').set('X-User-Id', String(userId)).set('Idempotency-Key', key).send(payload),
+      request(app).post('/surveys/quick').set('X-User-Id', String(userId)).set('Idempotency-Key', key).send(payload),
+    ]);
+
+    // One may legitimately get 202 if it lands during the processing window.
+    expect([200, 202]).toContain(a.status);
+    expect([200, 202]).toContain(b.status);
+
+    const ok = [a, b].find((r) => r.status === 200);
+    expect(ok).toBeTruthy();
+
+    // Ensure replay eventually returns the canonical response.
+    const replay = await request(app)
+      .post('/surveys/quick')
+      .set('X-User-Id', String(userId))
+      .set('Idempotency-Key', key)
+      .send(payload)
+      .expect(200);
+
+    expect(replay.body).toEqual(ok!.body);
+
+    const entryCount = await pool.query<{ c: string }>('SELECT COUNT(*)::text AS c FROM survey_entries WHERE user_id = $1', [userId]);
+    expect(entryCount.rows[0]!.c).toBe('1');
+
+    const effectsCount = await pool.query<{ c: string }>('SELECT COUNT(*)::text AS c FROM side_effects');
+    expect(effectsCount.rows[0]!.c).toBe('1');
   });
 });
 
