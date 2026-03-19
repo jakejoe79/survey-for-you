@@ -7,6 +7,8 @@ export type SideEffectRow = {
   status: 'pending' | 'running' | 'executed';
   attempt_id: string | null;
   payload: unknown;
+  attempt_count: number;
+  next_run_at: string;
   updated_at: string;
 };
 
@@ -55,16 +57,18 @@ export async function claimNextPending(
     `
     UPDATE side_effects
     SET status = 'running',
-        attempt_id = $1
+        attempt_id = $1,
+        attempt_count = attempt_count + 1
     WHERE id = (
       SELECT id
       FROM side_effects
       WHERE status = 'pending'
-      ORDER BY updated_at ASC
+        AND next_run_at <= NOW()
+      ORDER BY next_run_at ASC, updated_at ASC
       FOR UPDATE SKIP LOCKED
       LIMIT 1
     )
-    RETURNING id, idempotency_id, effect_type, status, attempt_id, payload, updated_at
+    RETURNING id, idempotency_id, effect_type, status, attempt_id, payload, attempt_count, next_run_at, updated_at
     `,
     [params.attemptId],
   );
@@ -121,6 +125,23 @@ export async function resetToPending(
       AND status = 'running'
     `,
     [params.idempotencyId, params.effectType],
+  );
+}
+
+export async function scheduleRetry(
+  client: PoolClient,
+  params: { idempotencyId: number; effectType: string; delaySeconds: number },
+): Promise<void> {
+  await client.query(
+    `
+    UPDATE side_effects
+    SET status = 'pending',
+        next_run_at = NOW() + make_interval(secs => $3)
+    WHERE idempotency_id = $1
+      AND effect_type = $2
+      AND status = 'running'
+    `,
+    [params.idempotencyId, params.effectType, params.delaySeconds],
   );
 }
 

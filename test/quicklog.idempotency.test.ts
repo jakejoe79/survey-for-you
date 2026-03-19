@@ -163,5 +163,36 @@ maybeDescribe('POST /surveys/quick idempotency canary', () => {
     );
     expect(status.rows[0]!.status).toBe('executed');
   });
+
+  it('recovers a stuck running effect and executes it once', async () => {
+    const idRes = await pool.query<{ id: number }>(
+      `
+      INSERT INTO idempotency_keys (user_id, key, status, request_version, expires_at)
+      VALUES ($1, 'seed-key-2', 'completed', 1, NOW() + interval '24 hours')
+      RETURNING id
+      `,
+      [userId],
+    );
+    const idemId = idRes.rows[0]!.id;
+
+    // Create a stuck running job (simulate crash mid-execution).
+    await pool.query(
+      `
+      INSERT INTO side_effects (idempotency_id, effect_type, status, payload, attempt_count, next_run_at, updated_at)
+      VALUES ($1, 'quick_log_analytics', 'running', '{}'::jsonb, 1, NOW(), NOW() - interval '10 minutes')
+      `,
+      [idemId],
+    );
+
+    // Worker run should recover it to pending, then execute.
+    const didWork = await runWorkerOnce(pool);
+    expect(didWork).toBe(true);
+
+    const status = await pool.query<{ status: string }>(
+      `SELECT status FROM side_effects WHERE idempotency_id = $1 AND effect_type = 'quick_log_analytics'`,
+      [idemId],
+    );
+    expect(status.rows[0]!.status).toBe('executed');
+  });
 });
 
