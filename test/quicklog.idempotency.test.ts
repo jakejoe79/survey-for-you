@@ -72,7 +72,8 @@ maybeDescribe('POST /surveys/quick idempotency canary', () => {
     const entryCount = await pool.query<{ c: string }>('SELECT COUNT(*)::text AS c FROM survey_entries WHERE user_id = $1', [userId]);
     expect(entryCount.rows[0]!.c).toBe('1');
 
-    const effectsCount = await pool.query<{ c: string }>('SELECT COUNT(*)::text AS c FROM side_effects');
+    // Side effect is prepared in-tx; execution happens post-commit and can be async.
+    const effectsCount = await pool.query<{ c: string }>("SELECT COUNT(*)::text AS c FROM side_effects WHERE status IN ('pending','running','executed')");
     expect(effectsCount.rows[0]!.c).toBe('1');
   });
 
@@ -128,7 +129,7 @@ maybeDescribe('POST /surveys/quick idempotency canary', () => {
     const entryCount = await pool.query<{ c: string }>('SELECT COUNT(*)::text AS c FROM survey_entries WHERE user_id = $1', [userId]);
     expect(entryCount.rows[0]!.c).toBe('1');
 
-    const effectsCount = await pool.query<{ c: string }>('SELECT COUNT(*)::text AS c FROM side_effects');
+    const effectsCount = await pool.query<{ c: string }>("SELECT COUNT(*)::text AS c FROM side_effects WHERE status IN ('pending','running','executed')");
     expect(effectsCount.rows[0]!.c).toBe('1');
   });
 });

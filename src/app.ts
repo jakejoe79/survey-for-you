@@ -5,7 +5,7 @@ import { claimOrReplay } from './idempotency/IdempotencyService';
 import { computeResolvedHashForLoggingOnly } from './idempotency/IdempotencyService';
 import { logInfo, logWarn } from './lib/logger';
 import { completeWithStub, getForUpdate } from './repositories/idempotencyRepo';
-import { runOnce } from './side-effects/SideEffectGate';
+import { prepare, runPostCommit } from './side-effects/SideEffectGate';
 import { quickLogCore, resolveDefaults } from './quick-log/QuickLogService';
 
 export function createApp(pool: Pool) {
@@ -31,6 +31,8 @@ export function createApp(pool: Pool) {
     const payload = req.body?.payload ?? req.body;
 
     try {
+      const effectsToRun: Array<() => Promise<void>> = [];
+
       const result = await withTx(pool, async (client) => {
         const gate = await claimOrReplay(client, { userId, key: idempotencyKey });
 
@@ -65,14 +67,24 @@ export function createApp(pool: Pool) {
         // claimed
         const core = await quickLogCore(client, { userId, payload, writeSource: 'quick_log' });
 
-        // Example gated side effect (no-op body): proves once-only behavior.
-        await runOnce(client, {
+        // Record intent in DB (inside tx), run after commit.
+        const prepared = await prepare(client, {
           userId,
           idempotencyId: gate.idempotencyId,
           attemptId: gate.attemptId,
           effectType: 'quick_log_analytics',
-          fn: async () => undefined,
         });
+
+        if (prepared.shouldRun) {
+          effectsToRun.push(async () => {
+            await runPostCommit(pool, {
+              userId,
+              idempotencyId: gate.idempotencyId,
+              effectType: 'quick_log_analytics',
+              fn: async () => undefined,
+            });
+          });
+        }
 
         await completeWithStub(client, {
           idempotencyId: gate.idempotencyId,
@@ -88,6 +100,11 @@ export function createApp(pool: Pool) {
 
         return { statusCode: 200 as const, body: core.response };
       });
+
+      // Execute post-commit side effects. Never block writes; failures are logged and retriable.
+      for (const effect of effectsToRun) {
+        void effect();
+      }
 
       return res.status(result.statusCode).json(result.body);
     } catch (err) {
